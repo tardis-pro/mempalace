@@ -114,6 +114,11 @@ impl Miner {
             .follow_links(false)
             .build();
 
+        // Buffer drawers across files and flush in batches of BATCH_SIZE —
+        // amortises embedding cost for backends that batch (LanceDbPalace).
+        const BATCH_SIZE: usize = 64;
+        let mut buffer: Vec<DrawerRecord> = Vec::with_capacity(BATCH_SIZE);
+
         for entry in walker.flatten() {
             let path = entry.path();
             if !path.is_file() {
@@ -162,27 +167,41 @@ impl Miner {
                 .strip_prefix(&canonical_root)
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|_| path.to_path_buf());
-            self.ingest_file_content(palace, &content, &relative, &mut stats)?;
+            self.chunks_into_buffer(&content, &relative, &mut buffer);
             stats.files_indexed += 1;
+
+            while buffer.len() >= BATCH_SIZE {
+                let rest = buffer.split_off(BATCH_SIZE);
+                let flushed = buffer.len();
+                palace.add_many(std::mem::replace(&mut buffer, rest))?;
+                stats.drawers_written += flushed;
+            }
+        }
+
+        if !buffer.is_empty() {
+            let flushed = buffer.len();
+            palace.add_many(buffer)?;
+            stats.drawers_written += flushed;
         }
 
         Ok(stats)
     }
 
-    fn ingest_file_content(
+    /// Chunk a file's content into drawer records and append them to `buffer`.
+    /// Stateless — caller owns flushing.
+    fn chunks_into_buffer(
         &self,
-        palace: &mut dyn Palace,
         content: &str,
         relative_path: &Path,
-        stats: &mut IngestStats,
-    ) -> Result<()> {
+        buffer: &mut Vec<DrawerRecord>,
+    ) {
         let chunks = chunk_text(content, self.options.chunk_size, self.options.chunk_overlap);
         for (idx, chunk) in chunks.into_iter().enumerate() {
             if chunk.len() < MIN_CHUNK_SIZE {
                 continue;
             }
             let drawer_id = compute_drawer_id(relative_path, idx, &chunk);
-            let record = DrawerRecord {
+            buffer.push(DrawerRecord {
                 id: drawer_id,
                 content: chunk,
                 metadata: DrawerMetadata {
@@ -194,16 +213,8 @@ impl Miner {
                     importance: Some(3.0),
                     ..DrawerMetadata::default()
                 },
-            };
-            match palace.add(record) {
-                Ok(()) => stats.drawers_written += 1,
-                Err(mempalace_store::palace::PalaceError::Duplicate(_)) => {
-                    stats.drawers_skipped_existing += 1;
-                }
-                Err(e) => return Err(IngestError::Palace(e)),
-            }
+            });
         }
-        Ok(())
     }
 }
 

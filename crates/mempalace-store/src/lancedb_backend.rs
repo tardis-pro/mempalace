@@ -26,9 +26,11 @@
 //!   escaped by doubling (`'` → `''`). This is the same rule Postgres and
 //!   SQLite use for single-quoted literals.
 
+use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use arrow_array::{
     Array, FixedSizeListArray, Float32Array, Float64Array, Int64Array, RecordBatch,
@@ -36,6 +38,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use fs2::FileExt;
 use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::{Connection, DistanceType, Table};
@@ -60,6 +63,11 @@ pub struct LanceDbPalace {
     embedder: Mutex<TextEmbedding>,
     next_seq: Mutex<i64>,
     table_name: String,
+    /// Exclusive file lock held for the lifetime of this handle. Ensures at
+    /// most one writer per palace directory across processes on the same
+    /// host. Released automatically on drop.
+    #[allow(dead_code)]
+    lock_file: File,
 }
 
 impl std::fmt::Debug for LanceDbPalace {
@@ -70,6 +78,14 @@ impl std::fmt::Debug for LanceDbPalace {
     }
 }
 
+impl Drop for LanceDbPalace {
+    fn drop(&mut self) {
+        // The fs2 lock releases automatically when `lock_file` is dropped.
+        // We just remove the pid marker as a courtesy.
+        let _ = FileExt::unlock(&self.lock_file);
+    }
+}
+
 impl LanceDbPalace {
     /// Open (or create) a palace at `path` using the default table name.
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
@@ -77,6 +93,11 @@ impl LanceDbPalace {
     }
 
     /// Open (or create) a palace at `path` with a specific table name.
+    ///
+    /// Acquires an exclusive file lock at `<path>/.lock` so that at most one
+    /// `LanceDbPalace` handle can exist per directory across processes on the
+    /// same host. If the lock is held by another process, retries for up to
+    /// 5 seconds before returning `PalaceError::Backend("palace is locked …")`.
     pub fn new_with_table(path: impl AsRef<Path>, table_name: &str) -> Result<Self> {
         if Handle::try_current().is_ok() {
             return Err(PalaceError::Backend(
@@ -86,6 +107,55 @@ impl LanceDbPalace {
             ));
         }
 
+        // Ensure the palace dir exists, then acquire the exclusive lock.
+        let path_ref = path.as_ref();
+        std::fs::create_dir_all(path_ref).map_err(|e| {
+            PalaceError::Backend(format!(
+                "failed to create palace dir {}: {e}",
+                path_ref.display()
+            ))
+        })?;
+        let lock_path = path_ref.join(".lock");
+        let lock_file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| {
+                PalaceError::Backend(format!(
+                    "failed to open palace lockfile {}: {e}",
+                    lock_path.display()
+                ))
+            })?;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut attempt = 0u32;
+        loop {
+            match FileExt::try_lock_exclusive(&lock_file) {
+                Ok(()) => break,
+                Err(_) if Instant::now() < deadline => {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(200));
+                    if attempt % 5 == 0 {
+                        debug!(
+                            path = %lock_path.display(),
+                            "waiting for palace lock (another mempalace process holds it)"
+                        );
+                    }
+                }
+                Err(e) => {
+                    return Err(PalaceError::Backend(format!(
+                        "palace is locked by another mempalace process ({}): {e}. \
+                         stop the running daemon or mining job before opening this palace.",
+                        lock_path.display()
+                    )));
+                }
+            }
+        }
+        // Record our PID so humans grepping lsof know who holds it. Ignored on failure.
+        let _ = std::fs::write(path_ref.join(".lock.pid"), std::process::id().to_string());
+
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .worker_threads(2)
@@ -93,8 +163,7 @@ impl LanceDbPalace {
             .build()
             .map_err(|e| PalaceError::Backend(format!("failed to build tokio runtime: {e}")))?;
 
-        let path_str = path
-            .as_ref()
+        let path_str = path_ref
             .to_str()
             .ok_or_else(|| PalaceError::Backend("lancedb path is not valid UTF-8".to_string()))?
             .to_string();
@@ -126,6 +195,34 @@ impl LanceDbPalace {
                     .map_err(|e| PalaceError::Backend(format!("create table failed: {e}")))?
             };
 
+            // Ensure a BTree scalar index exists on the `id` column.
+            // `merge_insert` uses this for O(log n) duplicate-key lookups
+            // instead of a full-table scan. Idempotent: we skip if a scalar
+            // index on `id` already exists. One-time ~seconds cost on
+            // existing data; free on subsequent opens.
+            let indices = table
+                .list_indices()
+                .await
+                .map_err(|e| PalaceError::Backend(format!("list_indices failed: {e}")))?;
+            let has_id_index = indices
+                .iter()
+                .any(|cfg| cfg.columns.len() == 1 && cfg.columns[0] == "id");
+            if !has_id_index {
+                debug!("creating BTree scalar index on id column (first run)");
+                table
+                    .create_index(
+                        &["id"],
+                        lancedb::index::Index::BTree(
+                            lancedb::index::scalar::BTreeIndexBuilder::default(),
+                        ),
+                    )
+                    .execute()
+                    .await
+                    .map_err(|e| {
+                        PalaceError::Backend(format!("create id index failed: {e}"))
+                    })?;
+            }
+
             Ok::<_, PalaceError>((conn, table))
         })?;
 
@@ -148,6 +245,7 @@ impl LanceDbPalace {
             embedder: Mutex::new(embedder),
             next_seq: Mutex::new(next_seq),
             table_name: table_name_owned,
+            lock_file,
         })
     }
 
@@ -162,6 +260,32 @@ impl LanceDbPalace {
         out.into_iter()
             .next()
             .ok_or_else(|| PalaceError::Backend("fastembed returned empty output".to_string()))
+    }
+
+    /// Embed a batch of texts in one fastembed call. Amortises tokenizer +
+    /// ONNX session overhead across the whole batch — much faster than
+    /// calling [`Self::embed_one`] per record during bulk ingest.
+    fn embed_many(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut guard = self
+            .embedder
+            .lock()
+            .map_err(|e| PalaceError::Backend(format!("embedder mutex poisoned: {e}")))?;
+        guard
+            .embed(texts, Some(64))
+            .map_err(|e| PalaceError::Backend(format!("fastembed batch embed failed: {e}")))
+    }
+
+    fn bump_seq_many(&self, n: usize) -> Result<Vec<i64>> {
+        let mut g = self
+            .next_seq
+            .lock()
+            .map_err(|e| PalaceError::Backend(format!("seq mutex poisoned: {e}")))?;
+        let start = *g;
+        *g = start.saturating_add(n as i64);
+        Ok((0..n as i64).map(|i| start + i).collect())
     }
 
     fn bump_seq(&self) -> Result<i64> {
@@ -356,6 +480,120 @@ fn row_similarity(batch: &RecordBatch, row: usize) -> Result<f64> {
     Ok(1.0 - distance)
 }
 
+fn build_insert_batch_many(
+    schema: SchemaRef,
+    records: &[DrawerRecord],
+    vectors: Vec<Vec<f32>>,
+    seqs: &[i64],
+) -> Result<RecordBatch> {
+    if records.len() != vectors.len() || records.len() != seqs.len() {
+        return Err(PalaceError::Backend(format!(
+            "build_insert_batch_many length mismatch: records={}, vectors={}, seqs={}",
+            records.len(),
+            vectors.len(),
+            seqs.len()
+        )));
+    }
+    for (i, v) in vectors.iter().enumerate() {
+        if v.len() != EMBEDDING_DIM as usize {
+            return Err(PalaceError::Backend(format!(
+                "embedding at row {i} has wrong dim: got {}, expected {}",
+                v.len(),
+                EMBEDDING_DIM
+            )));
+        }
+    }
+
+    let id = Arc::new(StringArray::from(
+        records.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+    )) as Arc<dyn Array>;
+    let content = Arc::new(StringArray::from(
+        records.iter().map(|r| r.content.clone()).collect::<Vec<_>>(),
+    )) as Arc<dyn Array>;
+
+    let vector_rows: Vec<Option<Vec<Option<f32>>>> = vectors
+        .into_iter()
+        .map(|v| Some(v.into_iter().map(Some).collect()))
+        .collect();
+    let vector_array =
+        FixedSizeListArray::from_iter_primitive::<arrow_array::types::Float32Type, _, _>(
+            vector_rows.into_iter(),
+            EMBEDDING_DIM,
+        );
+    let vector: Arc<dyn Array> = Arc::new(vector_array);
+
+    let wing = Arc::new(StringArray::from(
+        records
+            .iter()
+            .map(|r| r.metadata.wing.clone())
+            .collect::<Vec<_>>(),
+    )) as Arc<dyn Array>;
+    let room = Arc::new(StringArray::from(
+        records
+            .iter()
+            .map(|r| r.metadata.room.clone())
+            .collect::<Vec<_>>(),
+    )) as Arc<dyn Array>;
+    let hall = Arc::new(StringArray::from(
+        records
+            .iter()
+            .map(|r| r.metadata.hall.clone())
+            .collect::<Vec<_>>(),
+    )) as Arc<dyn Array>;
+    let source_file = Arc::new(StringArray::from(
+        records
+            .iter()
+            .map(|r| r.metadata.source_file.clone())
+            .collect::<Vec<_>>(),
+    )) as Arc<dyn Array>;
+    let date = Arc::new(StringArray::from(
+        records
+            .iter()
+            .map(|r| r.metadata.date.clone())
+            .collect::<Vec<_>>(),
+    )) as Arc<dyn Array>;
+    let importance = Arc::new(Float64Array::from(
+        records
+            .iter()
+            .map(|r| r.metadata.importance)
+            .collect::<Vec<_>>(),
+    )) as Arc<dyn Array>;
+
+    let extra_json_col: Vec<Option<String>> = records
+        .iter()
+        .map(|r| {
+            if r.metadata.extra.is_empty() {
+                Ok(None)
+            } else {
+                serde_json::to_string(&r.metadata.extra)
+                    .map(Some)
+                    .map_err(|e| PalaceError::Backend(format!("extra_json serialize failed: {e}")))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let extra_json = Arc::new(StringArray::from(extra_json_col)) as Arc<dyn Array>;
+
+    let insert_seq = Arc::new(Int64Array::from(seqs.to_vec())) as Arc<dyn Array>;
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            id,
+            content,
+            vector,
+            wing,
+            room,
+            hall,
+            source_file,
+            date,
+            importance,
+            extra_json,
+            insert_seq,
+        ],
+    )
+    .map_err(|e| PalaceError::Backend(format!("build record batch failed: {e}")))
+}
+
 fn build_insert_batch(
     schema: SchemaRef,
     record: &DrawerRecord,
@@ -460,6 +698,121 @@ impl Palace for LanceDbPalace {
                 .await
                 .map(|_| ())
                 .map_err(|e| PalaceError::Backend(format!("add failed: {e}")))
+        })
+    }
+
+    /// Bulk insert with batched embedding and a single Arrow write.
+    ///
+    /// Three-stage dedup pipeline:
+    /// 1. **In-batch dedup** collapses any duplicate ids the caller passed
+    ///    in a single batch (merge_insert's behavior on duplicate source
+    ///    keys is undefined per the lancedb docs).
+    /// 2. **Id prefilter** queries the table with `id IN (...)` using the
+    ///    BTree scalar index built on the `id` column in [`new_with_table`]
+    ///    — O(batch_size × log N) key lookups. Rows whose id already exists
+    ///    are dropped *before* embedding. This is the big win: on a re-mine
+    ///    of fully-indexed data we do zero ONNX forward passes.
+    /// 3. **merge_insert safety net** handles the race where another writer
+    ///    inserts the same id between our prefilter SELECT and our INSERT.
+    ///    With `when_matched` defaulting to no-op and `when_not_matched_insert_all`
+    ///    enabled, matched rows are silently dropped.
+    ///
+    /// The old implementation did a full-table SELECT for dedup and
+    /// embedded every row regardless. With a 300k-drawer palace that
+    /// turned ingest quadratic; this version scales linearly with *new*
+    /// rows and is free for re-mines.
+    fn add_many(&mut self, records: Vec<DrawerRecord>) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        // Stage 1: in-batch dedup.
+        let mut seen_in_batch: std::collections::HashSet<String> =
+            std::collections::HashSet::with_capacity(records.len());
+        let mut staged: Vec<DrawerRecord> = Vec::with_capacity(records.len());
+        for r in records {
+            if seen_in_batch.insert(r.id.clone()) {
+                staged.push(r);
+            }
+        }
+        if staged.is_empty() {
+            return Ok(());
+        }
+
+        // Stage 2: id prefilter. Fast now that the BTree index exists.
+        let id_literals: Vec<String> = staged
+            .iter()
+            .map(|r| escape_sql_literal(&r.id))
+            .collect::<Result<Vec<_>>>()?;
+        let in_clause = id_literals
+            .iter()
+            .map(|s| format!("'{s}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let filter = format!("id IN ({in_clause})");
+
+        let existing_ids: std::collections::HashSet<String> =
+            self.runtime.block_on(async {
+                let stream = self
+                    .table
+                    .query()
+                    .only_if(filter)
+                    .select(lancedb::query::Select::columns(&["id"]))
+                    .execute()
+                    .await
+                    .map_err(|e| {
+                        PalaceError::Backend(format!("add_many prefilter query failed: {e}"))
+                    })?;
+                let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(|e| {
+                    PalaceError::Backend(format!("add_many prefilter collect failed: {e}"))
+                })?;
+                let mut set = std::collections::HashSet::new();
+                for b in &batches {
+                    for row in 0..b.num_rows() {
+                        if let Some(id) = read_string(b, "id", row)? {
+                            set.insert(id);
+                        }
+                    }
+                }
+                Ok::<_, PalaceError>(set)
+            })?;
+
+        let fresh: Vec<DrawerRecord> = staged
+            .into_iter()
+            .filter(|r| !existing_ids.contains(&r.id))
+            .collect();
+        if fresh.is_empty() {
+            return Ok(());
+        }
+
+        // Embed only the survivors.
+        let texts: Vec<String> = fresh.iter().map(|r| r.content.clone()).collect();
+        let vectors = self.embed_many(texts)?;
+        if vectors.len() != fresh.len() {
+            return Err(PalaceError::Backend(format!(
+                "embed_many returned {} vectors for {} records",
+                vectors.len(),
+                fresh.len()
+            )));
+        }
+
+        let seqs = self.bump_seq_many(fresh.len())?;
+        let schema = build_schema();
+        let batch = build_insert_batch_many(schema.clone(), &fresh, vectors, &seqs)?;
+
+        let reader: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(
+            RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema),
+        );
+
+        // Stage 3: merge_insert as safety net for concurrent writers.
+        self.runtime.block_on(async {
+            let mut builder = self.table.merge_insert(&["id"]);
+            builder.when_not_matched_insert_all();
+            builder
+                .execute(reader)
+                .await
+                .map(|_| ())
+                .map_err(|e| PalaceError::Backend(format!("add_many merge_insert failed: {e}")))
         })
     }
 

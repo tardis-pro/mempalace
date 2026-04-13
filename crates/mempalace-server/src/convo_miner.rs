@@ -383,6 +383,11 @@ impl ConvoMiner {
 
         let mut stats = ConvoMineStats::default();
 
+        // Buffer drawers across files and flush in BATCH_SIZE chunks — same
+        // motivation as Miner::mine, amortises embedding cost.
+        const BATCH_SIZE: usize = 64;
+        let mut buffer: Vec<DrawerRecord> = Vec::with_capacity(BATCH_SIZE);
+
         for filepath in &files {
             let source_file = filepath.to_string_lossy().to_string();
 
@@ -420,7 +425,7 @@ impl ConvoMiner {
                     for chunk in &chunks {
                         let drawer_id =
                             make_drawer_id(&wing, &room, &source_file, chunk.chunk_index);
-                        let record = DrawerRecord {
+                        buffer.push(DrawerRecord {
                             id: drawer_id,
                             content: chunk.content.clone(),
                             metadata: DrawerMetadata {
@@ -429,12 +434,7 @@ impl ConvoMiner {
                                 source_file: Some(source_file.clone()),
                                 ..DrawerMetadata::default()
                             },
-                        };
-                        match palace.add(record) {
-                            Ok(()) => stats.drawers_filed += 1,
-                            Err(PalaceError::Duplicate(_)) => { /* skip silently */ }
-                            Err(e) => return Err(ConvoMineError::Palace(e)),
-                        }
+                        });
                     }
                 }
                 ExtractMode::General => {
@@ -460,7 +460,7 @@ impl ConvoMiner {
 
                         let drawer_id =
                             make_drawer_id(&wing, &room, &source_file, mem.chunk_index as usize);
-                        let record = DrawerRecord {
+                        buffer.push(DrawerRecord {
                             id: drawer_id,
                             content: mem.content.clone(),
                             metadata: DrawerMetadata {
@@ -469,17 +469,29 @@ impl ConvoMiner {
                                 source_file: Some(source_file.clone()),
                                 ..DrawerMetadata::default()
                             },
-                        };
-                        match palace.add(record) {
-                            Ok(()) => stats.drawers_filed += 1,
-                            Err(PalaceError::Duplicate(_)) => { /* skip silently */ }
-                            Err(e) => return Err(ConvoMineError::Palace(e)),
-                        }
+                        });
                     }
                 }
             }
 
             stats.files_processed += 1;
+
+            while buffer.len() >= BATCH_SIZE {
+                let rest = buffer.split_off(BATCH_SIZE);
+                let flushed = buffer.len();
+                palace
+                    .add_many(std::mem::replace(&mut buffer, rest))
+                    .map_err(ConvoMineError::Palace)?;
+                stats.drawers_filed += flushed;
+            }
+        }
+
+        if !buffer.is_empty() {
+            let flushed = buffer.len();
+            palace
+                .add_many(buffer)
+                .map_err(ConvoMineError::Palace)?;
+            stats.drawers_filed += flushed;
         }
 
         Ok(stats)

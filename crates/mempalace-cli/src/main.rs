@@ -4,7 +4,7 @@
 #![allow(clippy::expect_used)]
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -13,11 +13,14 @@ use mempalace_server::hooks::{SaveHook, SaveRequest};
 use mempalace_server::ingest::{Miner, MinerOptions};
 use mempalace_server::mcp::McpServer;
 use mempalace_server::onboarding::WingConfig;
+use mempalace_server::opencode_reader::mine_opencode;
 use mempalace_server::searcher::{format_human, search_memories, SearchQuery};
 use mempalace_store::knowledge_graph::KnowledgeGraph;
 use mempalace_store::layers::MemoryStack;
 use mempalace_store::palace::{DrawerRecord, InMemoryPalace, Palace, SearchFilter};
+use mempalace_store::LanceDbPalace;
 use mempalace_text::dialect::Dialect;
+use tokio::io::AsyncWriteExt;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -58,14 +61,14 @@ enum Command {
         project: Vec<String>,
     },
 
-    #[command(about = "Mine a directory into the palace (project files or conversations)")]
+    #[command(about = "Mine a directory into the palace (project files, conversations, or opencode storage)")]
     Mine {
         dir: PathBuf,
         #[arg(long)]
         wing: Option<String>,
         #[arg(long, default_value = "general")]
         room: String,
-        #[arg(long, default_value = "projects", value_parser = ["projects", "convos"])]
+        #[arg(long, default_value = "projects", value_parser = ["projects", "convos", "opencode"])]
         mode: String,
         #[arg(long, default_value = "exchange", value_parser = ["exchange", "general"])]
         extract: String,
@@ -99,7 +102,20 @@ enum Command {
     },
 
     #[command(about = "Run MCP server over stdio (for Claude / ChatGPT / Cursor)")]
-    McpServe,
+    McpServe {
+        /// Proxy stdin/stdout to a running mempalace daemon over this Unix socket
+        /// instead of owning the palace directly. Lets multiple agents share a
+        /// single palace-holding process, which is required for concurrent writes.
+        #[arg(long)]
+        connect: Option<PathBuf>,
+    },
+
+    #[command(about = "Run the palace daemon: one process owns the palace and accepts MCP connections over a Unix socket")]
+    Daemon {
+        /// Unix socket path to bind. Defaults to <palace>/mempalace.sock.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
 
     #[command(about = "Compress palace drawers to AAAK Dialect for token savings")]
     Compress {
@@ -123,8 +139,22 @@ fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to initialise tracing subscriber: {e}"))?;
 
     let cli = Cli::parse();
+    let palace_path = cli.palace.clone();
 
-    let mut palace: Box<dyn Palace> = Box::new(InMemoryPalace::new());
+    // Commands that manage their own palace + runtime must run BEFORE
+    // open_palace() — LanceDbPalace refuses to construct inside a running
+    // tokio runtime, and mcp-serve/daemon both create their own runtime.
+    match &cli.command {
+        Command::McpServe { connect } => {
+            return cmd_mcp_serve(palace_path.as_deref(), connect.as_deref());
+        }
+        Command::Daemon { socket } => {
+            return cmd_daemon(palace_path.as_deref(), socket.as_deref());
+        }
+        _ => {}
+    }
+
+    let mut palace = open_palace(palace_path.as_deref())?;
 
     match cli.command {
         Command::Status => cmd_status(palace.as_ref()),
@@ -145,7 +175,7 @@ fn main() -> Result<()> {
         Command::WakeUp { wing } => cmd_wake_up(palace.as_ref(), wing.as_deref()),
         Command::Split { dir, dry_run } => cmd_split(&dir, dry_run),
         Command::Mcp => cmd_mcp(),
-        Command::McpServe => cmd_mcp_serve(),
+        Command::McpServe { .. } | Command::Daemon { .. } => unreachable!("handled above"),
         Command::HookSave {
             wing,
             room,
@@ -154,6 +184,24 @@ fn main() -> Result<()> {
         } => cmd_hook_save(palace.as_mut(), wing, room, source, content),
         Command::Compress { wing, dry_run } => cmd_compress(palace.as_mut(), wing, dry_run),
         Command::Instructions => cmd_instructions(),
+    }
+}
+
+/// Open a palace backend. With `Some(path)` returns a persistent
+/// `LanceDbPalace`; with `None` returns an ephemeral `InMemoryPalace`.
+///
+/// Must be called before any tokio runtime is active — `LanceDbPalace::new`
+/// refuses to construct from within a running runtime.
+fn open_palace(path: Option<&Path>) -> Result<Box<dyn Palace>> {
+    match path {
+        Some(p) => {
+            std::fs::create_dir_all(p)
+                .with_context(|| format!("failed to create palace directory {}", p.display()))?;
+            let palace = LanceDbPalace::new(p)
+                .with_context(|| format!("failed to open LanceDbPalace at {}", p.display()))?;
+            Ok(Box::new(palace))
+        }
+        None => Ok(Box::new(InMemoryPalace::new())),
     }
 }
 
@@ -233,7 +281,12 @@ fn cmd_mine(
                 .with_context(|| format!("mining conversations from {}", dir.display()))?;
             println!("{stats:#?}");
         }
-        _ => unreachable!("clap value_parser restricts to projects|convos"),
+        "opencode" => {
+            let stats = mine_opencode(dir, palace, wing)
+                .with_context(|| format!("mining opencode storage from {}", dir.display()))?;
+            println!("{stats:#?}");
+        }
+        _ => unreachable!("clap value_parser restricts to projects|convos|opencode"),
     }
     Ok(())
 }
@@ -303,15 +356,111 @@ fn cmd_hook_save(
     Ok(())
 }
 
-fn cmd_mcp_serve() -> Result<()> {
-    let palace: Box<dyn Palace> = Box::new(InMemoryPalace::new());
-    // TODO(R4): wire LanceDbPalace behind --in-memory=false / lancedb-backend feature
-    let kg =
-        KnowledgeGraph::open(":memory:").context("failed to open in-memory knowledge graph")?;
+fn cmd_mcp_serve(palace_path: Option<&Path>, connect: Option<&Path>) -> Result<()> {
+    // Client mode: proxy stdin/stdout to a running daemon over a Unix
+    // socket. Does not open the palace — the daemon owns it.
+    if let Some(socket) = connect {
+        return run_mcp_proxy(socket);
+    }
+
+    // Standalone mode: this process owns the palace directly over stdio.
+    // LanceDbPalace::new() refuses to run inside an active tokio runtime,
+    // so we must build the palace and knowledge graph BEFORE creating
+    // the runtime below.
+    let palace = open_palace(palace_path)?;
+
+    let kg = match palace_path {
+        Some(p) => {
+            let kg_path = p.join("knowledge_graph.sqlite3");
+            KnowledgeGraph::open(&kg_path).with_context(|| {
+                format!("failed to open knowledge graph at {}", kg_path.display())
+            })?
+        }
+        None => KnowledgeGraph::open(":memory:")
+            .context("failed to open in-memory knowledge graph")?,
+    };
+
     let server = McpServer::new(palace, kg);
 
     let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
     rt.block_on(mempalace_server::serve_stdio(server))
+}
+
+/// Run the palace daemon: bind a Unix socket, accept MCP connections,
+/// and serve them from a single shared `McpServer` holding the palace
+/// exclusive lock. Exits cleanly on SIGINT/SIGTERM.
+fn cmd_daemon(palace_path: Option<&Path>, socket_override: Option<&Path>) -> Result<()> {
+    let palace_dir = palace_path.ok_or_else(|| {
+        anyhow::anyhow!("--palace <DIR> is required for daemon mode (in-memory palace is not shareable)")
+    })?;
+
+    let socket_path: PathBuf = match socket_override {
+        Some(p) => p.to_path_buf(),
+        None => palace_dir.join("mempalace.sock"),
+    };
+
+    // Palace + KG before tokio runtime (lock acquisition happens here).
+    let palace = open_palace(Some(palace_dir))?;
+    let kg_path = palace_dir.join("knowledge_graph.sqlite3");
+    let kg = KnowledgeGraph::open(&kg_path)
+        .with_context(|| format!("failed to open knowledge graph at {}", kg_path.display()))?;
+
+    let server = McpServer::new(palace, kg);
+
+    // Write pid file for observability.
+    let pid_path = palace_dir.join("mempalace.pid");
+    let _ = std::fs::write(&pid_path, std::process::id().to_string());
+
+    let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+
+    let socket_for_cleanup = socket_path.clone();
+    let pid_for_cleanup = pid_path.clone();
+    let result = rt.block_on(async move {
+        tokio::select! {
+            r = mempalace_server::serve_unix_socket(server, &socket_path) => r,
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("received SIGINT, shutting down daemon");
+                Ok(())
+            }
+        }
+    });
+
+    // Best-effort cleanup: remove socket + pid file on shutdown.
+    let _ = std::fs::remove_file(&socket_for_cleanup);
+    let _ = std::fs::remove_file(&pid_for_cleanup);
+
+    result
+}
+
+/// Byte-pump proxy: copy stdin → UnixStream and UnixStream → stdout until
+/// either side closes. Used by `mempalace mcp-serve --connect <socket>` so
+/// that agents spawning a fresh `mcp-serve` per session all talk to the
+/// single long-running daemon.
+fn run_mcp_proxy(socket_path: &Path) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+    rt.block_on(async move {
+        let stream = tokio::net::UnixStream::connect(socket_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to connect to daemon socket {}. is the daemon running?",
+                    socket_path.display()
+                )
+            })?;
+        let (mut rsock, mut wsock) = stream.into_split();
+        let mut stdin = tokio::io::stdin();
+        let mut stdout = tokio::io::stdout();
+
+        let up = async {
+            let _ = tokio::io::copy(&mut stdin, &mut wsock).await;
+            let _ = wsock.shutdown().await;
+        };
+        let down = async {
+            let _ = tokio::io::copy(&mut rsock, &mut stdout).await;
+        };
+        tokio::join!(up, down);
+        Ok::<(), anyhow::Error>(())
+    })
 }
 
 fn cmd_compress(palace: &mut dyn Palace, wing: Option<String>, dry_run: bool) -> Result<()> {

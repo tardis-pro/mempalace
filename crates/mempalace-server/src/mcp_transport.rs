@@ -1,8 +1,11 @@
-//! MCP stdio transport using rmcp 0.16.
+//! MCP transports using rmcp 0.16.
 //!
-//! Exposes every `McpServer` tool over a JSON-RPC stdio transport so that
-//! Claude, Cursor, or any MCP-compatible client can call them.
+//! Exposes every `McpServer` tool over either a JSON-RPC stdio transport
+//! (default, used directly by Claude/Cursor/etc. spawning `mempalace mcp-serve`)
+//! or a Unix-socket transport (used by `mempalace daemon` so multiple agents
+//! can share a single palace-holding process).
 
+use std::path::Path;
 use std::sync::Arc;
 
 use rmcp::handler::server::router::tool::CallToolHandlerExt;
@@ -14,6 +17,8 @@ use rmcp::transport::io::stdio;
 use rmcp::ServiceExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use tokio::net::UnixListener;
+use tracing::{error, info, warn};
 
 use crate::mcp::{AddDrawerRequest, McpServer};
 
@@ -136,11 +141,91 @@ fn to_json(value: &impl Serialize) -> Result<String, String> {
 /// Run the MCP server over stdin/stdout using rmcp's stdio transport.
 pub async fn serve_stdio(server: McpServer) -> anyhow::Result<()> {
     let inner = Arc::new(server);
+    let router = build_router(Arc::clone(&inner));
+
+    let running = router
+        .serve(stdio())
+        .await
+        .map_err(|e| anyhow::anyhow!("MCP server initialization failed: {e}"))?;
+    running
+        .waiting()
+        .await
+        .map_err(|e| anyhow::anyhow!("MCP server error: {e}"))?;
+
+    Ok(())
+}
+
+/// Run the MCP server over a Unix domain socket.
+///
+/// Used by `mempalace daemon`. The palace-holding process binds `socket_path`
+/// (replacing any stale socket file), then accepts connections in a loop. Each
+/// connected agent gets its own `Router` instance sharing the same underlying
+/// `McpServer` (and therefore the same `Palace` handle with its exclusive
+/// file lock). The router's tool dispatch is serialized internally, so
+/// concurrent clients issue calls safely without racing on the palace.
+///
+/// The socket is created with mode `0600` so other local users cannot
+/// connect to this process's palace.
+pub async fn serve_unix_socket(server: McpServer, socket_path: &Path) -> anyhow::Result<()> {
+    // Remove stale socket file from a previous daemon run. `bind` will
+    // otherwise fail with "Address already in use".
+    if socket_path.exists() {
+        std::fs::remove_file(socket_path)
+            .map_err(|e| anyhow::anyhow!("failed to remove stale socket {}: {e}", socket_path.display()))?;
+    }
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("failed to create socket parent {}: {e}", parent.display()))?;
+    }
+
+    let listener = UnixListener::bind(socket_path)
+        .map_err(|e| anyhow::anyhow!("failed to bind unix socket {}: {e}", socket_path.display()))?;
+
+    // Tighten permissions to owner-only. Best-effort; if it fails we still run.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(socket_path) {
+            let mut perm = meta.permissions();
+            perm.set_mode(0o600);
+            let _ = std::fs::set_permissions(socket_path, perm);
+        }
+    }
+
+    let inner = Arc::new(server);
+    info!(socket = %socket_path.display(), "mempalace daemon listening");
+
+    loop {
+        let (stream, _peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                error!("accept failed: {e}");
+                continue;
+            }
+        };
+        let inner_clone = Arc::clone(&inner);
+        tokio::spawn(async move {
+            let router = build_router(inner_clone);
+            match router.serve(stream).await {
+                Ok(running) => {
+                    if let Err(e) = running.waiting().await {
+                        warn!("MCP client session ended with error: {e}");
+                    }
+                }
+                Err(e) => warn!("MCP client session init failed: {e}"),
+            }
+        });
+    }
+}
+
+/// Build the full tool router shared by every transport. Takes the
+/// `Arc<McpServer>` so all tool closures can capture cheap clones of the
+/// shared handle.
+fn build_router(inner: Arc<McpServer>) -> Router<MempalaceMcp> {
     let handler = MempalaceMcp {
         inner: Arc::clone(&inner),
     };
-
-    let router = Router::new(handler)
+    Router::new(handler)
         // mempalace_status
         .with_tool({
             let s = Arc::clone(&inner);
@@ -356,16 +441,5 @@ pub async fn serve_stdio(server: McpServer) -> anyhow::Result<()> {
             .name("mempalace_graph_stats")
             .description("Get palace graph statistics (nodes, edges, etc.)")
             .parameters::<serde_json::Value>()
-        });
-
-    let running = router
-        .serve(stdio())
-        .await
-        .map_err(|e| anyhow::anyhow!("MCP server initialization failed: {e}"))?;
-    running
-        .waiting()
-        .await
-        .map_err(|e| anyhow::anyhow!("MCP server error: {e}"))?;
-
-    Ok(())
+        })
 }

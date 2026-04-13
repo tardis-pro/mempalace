@@ -80,6 +80,22 @@ pub trait Palace: std::fmt::Debug + Send + Sync {
         filter: &SearchFilter,
         n_results: usize,
     ) -> Result<Vec<SearchResult>>;
+
+    /// Bulk-insert a batch of records. Duplicates (same id as an existing
+    /// drawer) are silently skipped so ingestion pipelines can retry safely.
+    ///
+    /// The default implementation loops over [`Palace::add`]. Backends that
+    /// benefit from batching (e.g. vector stores that amortise embedding
+    /// cost) should override this with a single-batch path.
+    fn add_many(&mut self, records: Vec<DrawerRecord>) -> Result<()> {
+        for record in records {
+            match self.add(record) {
+                Ok(()) | Err(PalaceError::Duplicate(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
 }
 
 // ── In-memory reference backend ─────────────────────────────────────────

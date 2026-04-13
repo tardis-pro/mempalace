@@ -52,6 +52,7 @@ once_cell = "1"
 
 dirs = "5"
 ignore = "0.4"
+fs2 = "0.4"
 
 sha2 = "0.10"
 blake3 = "1"
