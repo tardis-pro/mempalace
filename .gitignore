@@ -1,0 +1,16 @@
+*.egg-info/
+dist/
+build/
+__pycache__/
+*.pyc
+.pytest_cache/
+mempal.yaml
+.a5c/
+
+target/
+Cargo.lock.bak
+*.rs.bk
+**/*.rs.bk
+.fastembed_cache/
+
+.sisyphus/ralph-loop.local.md
