@@ -381,17 +381,201 @@ impl ConvoMiner {
             files.truncate(self.limit);
         }
 
+        // Global per-wing pre-pass: skip anything already indexed. Lets
+        // re-mines fly past the embedder.
+        let existing_ids: std::collections::HashSet<String> =
+            palace.load_existing_ids_for_wing(&wing)?;
+        let existing_ids_arc = std::sync::Arc::new(existing_ids);
+
         let mut stats = ConvoMineStats::default();
 
-        // Buffer drawers across files and flush in BATCH_SIZE chunks — same
-        // motivation as Miner::mine, amortises embedding cost.
-        const BATCH_SIZE: usize = 64;
+        // Batch size 1024 (was 64) — same motivation as [`Miner::mine`].
+        // Amortises fastembed + lancedb overhead across far fewer flushes.
+        const BATCH_SIZE: usize = 1024;
+
+        // Dry-run path stays single-threaded and simple — it never touches
+        // the palace and there's no perf concern.
+        if self.dry_run {
+            return self.mine_dry_run(&files, &wing);
+        }
+
+        // Stage 1: parallel file processing. Each rayon worker normalizes,
+        // chunks, and emits pre-deduped DrawerRecords into a bounded
+        // channel. File-level stats events flow on a separate channel.
+        use crossbeam_channel::bounded;
+        use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+
+        let (record_tx, record_rx) = bounded::<(DrawerRecord, String)>(BATCH_SIZE * 4);
+        let (file_stat_tx, file_stat_rx) = bounded::<ConvoFileStat>(4096);
+
+        let wing_for_thread = wing.clone();
+        let extract_mode = self.extract_mode;
+        let existing_for_thread = existing_ids_arc.clone();
+        let files_for_thread = files.clone();
+        // Avoid holding references into `self` across the thread boundary;
+        // capture everything the closure needs by value.
+
+        let producer = {
+            let record_tx = record_tx.clone();
+            let file_stat_tx = file_stat_tx.clone();
+            std::thread::Builder::new()
+                .name("mempalace-convo-produce".to_string())
+                .spawn(move || {
+                    files_for_thread.par_iter().for_each(|filepath| {
+                        let rtx = &record_tx;
+                        let stx = &file_stat_tx;
+                        let source_file = filepath.to_string_lossy().to_string();
+
+                        let content = match normalize(filepath) {
+                            Ok(c) => c,
+                            Err(_) => {
+                                let _ = stx.send(ConvoFileStat::Skipped);
+                                return;
+                            }
+                        };
+
+                        if content.trim().len() < MIN_CHUNK_SIZE {
+                            let _ = stx.send(ConvoFileStat::Skipped);
+                            return;
+                        }
+
+                        match extract_mode {
+                            ExtractMode::Exchange => {
+                                let chunks = chunk_exchanges(&content);
+                                if chunks.is_empty() {
+                                    let _ = stx.send(ConvoFileStat::Skipped);
+                                    return;
+                                }
+                                let room = detect_convo_room(&content).to_string();
+                                let _ = stx.send(ConvoFileStat::ProcessedWithRoom(room.clone()));
+                                for chunk in &chunks {
+                                    let drawer_id = make_drawer_id(
+                                        &wing_for_thread,
+                                        &room,
+                                        &source_file,
+                                        chunk.chunk_index,
+                                    );
+                                    if existing_for_thread.contains(&drawer_id) {
+                                        continue;
+                                    }
+                                    let rec = DrawerRecord {
+                                        id: drawer_id,
+                                        content: chunk.content.clone(),
+                                        metadata: DrawerMetadata {
+                                            wing: Some(wing_for_thread.clone()),
+                                            room: Some(room.clone()),
+                                            source_file: Some(source_file.clone()),
+                                            ..DrawerMetadata::default()
+                                        },
+                                    };
+                                    if rtx.send((rec, room.clone())).is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            ExtractMode::General => {
+                                let memories = extract_memories(&content, 0.0);
+                                if memories.is_empty() {
+                                    let _ = stx.send(ConvoFileStat::Skipped);
+                                    return;
+                                }
+                                let _ = stx.send(ConvoFileStat::Processed);
+                                for mem in &memories {
+                                    let room = memory_type_to_room(&mem.memory_type).to_string();
+                                    let drawer_id = make_drawer_id(
+                                        &wing_for_thread,
+                                        &room,
+                                        &source_file,
+                                        mem.chunk_index as usize,
+                                    );
+                                    if existing_for_thread.contains(&drawer_id) {
+                                        continue;
+                                    }
+                                    let rec = DrawerRecord {
+                                        id: drawer_id,
+                                        content: mem.content.clone(),
+                                        metadata: DrawerMetadata {
+                                            wing: Some(wing_for_thread.clone()),
+                                            room: Some(room.clone()),
+                                            source_file: Some(source_file.clone()),
+                                            ..DrawerMetadata::default()
+                                        },
+                                    };
+                                    if rtx.send((rec, room)).is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                })
+                .map_err(|e| ConvoMineError::Io(e))?
+        };
+        drop(record_tx);
+        drop(file_stat_tx);
+
         let mut buffer: Vec<DrawerRecord> = Vec::with_capacity(BATCH_SIZE);
+        let drain_stats = |stats: &mut ConvoMineStats| {
+            while let Ok(ev) = file_stat_rx.try_recv() {
+                match ev {
+                    ConvoFileStat::Processed => stats.files_processed += 1,
+                    ConvoFileStat::ProcessedWithRoom(r) => {
+                        stats.files_processed += 1;
+                        *stats.room_counts.entry(r).or_insert(0) += 1;
+                    }
+                    ConvoFileStat::Skipped => stats.files_skipped += 1,
+                }
+            }
+        };
 
-        for filepath in &files {
-            let source_file = filepath.to_string_lossy().to_string();
+        while let Ok((rec, room)) = record_rx.recv() {
+            // General mode reports per-drawer room counts too; Exchange
+            // mode already bumped the count once per file via
+            // ProcessedWithRoom. To preserve the old semantics exactly for
+            // General, bump here only when mode is General. The original
+            // code incremented room_counts per memory in General, once per
+            // file in Exchange.
+            if matches!(self.extract_mode, ExtractMode::General) {
+                *stats.room_counts.entry(room).or_insert(0) += 1;
+            }
+            buffer.push(rec);
+            if buffer.len() >= BATCH_SIZE {
+                let flushed = buffer.len();
+                palace
+                    .add_many_prededuped(std::mem::take(&mut buffer))
+                    .map_err(ConvoMineError::Palace)?;
+                buffer.reserve(BATCH_SIZE);
+                stats.drawers_filed += flushed;
+                drain_stats(&mut stats);
+            }
+        }
 
-            // Normalize
+        if !buffer.is_empty() {
+            let flushed = buffer.len();
+            palace
+                .add_many_prededuped(buffer)
+                .map_err(ConvoMineError::Palace)?;
+            stats.drawers_filed += flushed;
+        }
+        palace.flush().map_err(ConvoMineError::Palace)?;
+
+        drain_stats(&mut stats);
+        if let Err(e) = producer.join() {
+            return Err(ConvoMineError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("convo producer thread panicked: {e:?}"),
+            )));
+        }
+        drain_stats(&mut stats);
+
+        Ok(stats)
+    }
+
+    /// Dry-run path kept sequential and simple — it never hits the palace
+    /// so there's no embedding work to parallelize.
+    fn mine_dry_run(&self, files: &[PathBuf], _wing: &str) -> Result<ConvoMineStats> {
+        let mut stats = ConvoMineStats::default();
+        for filepath in files {
             let content = match normalize(filepath) {
                 Ok(c) => c,
                 Err(_) => {
@@ -399,12 +583,10 @@ impl ConvoMiner {
                     continue;
                 }
             };
-
             if content.trim().len() < MIN_CHUNK_SIZE {
                 stats.files_skipped += 1;
                 continue;
             }
-
             match self.extract_mode {
                 ExtractMode::Exchange => {
                     let chunks = chunk_exchanges(&content);
@@ -412,30 +594,10 @@ impl ConvoMiner {
                         stats.files_skipped += 1;
                         continue;
                     }
-
                     let room = detect_convo_room(&content).to_string();
-                    *stats.room_counts.entry(room.clone()).or_insert(0) += 1;
-
-                    if self.dry_run {
-                        stats.drawers_filed += chunks.len();
-                        stats.files_processed += 1;
-                        continue;
-                    }
-
-                    for chunk in &chunks {
-                        let drawer_id =
-                            make_drawer_id(&wing, &room, &source_file, chunk.chunk_index);
-                        buffer.push(DrawerRecord {
-                            id: drawer_id,
-                            content: chunk.content.clone(),
-                            metadata: DrawerMetadata {
-                                wing: Some(wing.clone()),
-                                room: Some(room.clone()),
-                                source_file: Some(source_file.clone()),
-                                ..DrawerMetadata::default()
-                            },
-                        });
-                    }
+                    *stats.room_counts.entry(room).or_insert(0) += 1;
+                    stats.drawers_filed += chunks.len();
+                    stats.files_processed += 1;
                 }
                 ExtractMode::General => {
                     let memories = extract_memories(&content, 0.0);
@@ -443,59 +605,25 @@ impl ConvoMiner {
                         stats.files_skipped += 1;
                         continue;
                     }
-
-                    if self.dry_run {
-                        for mem in &memories {
-                            let room = memory_type_to_room(&mem.memory_type);
-                            *stats.room_counts.entry(room.to_string()).or_insert(0) += 1;
-                        }
-                        stats.drawers_filed += memories.len();
-                        stats.files_processed += 1;
-                        continue;
-                    }
-
                     for mem in &memories {
-                        let room = memory_type_to_room(&mem.memory_type).to_string();
-                        *stats.room_counts.entry(room.clone()).or_insert(0) += 1;
-
-                        let drawer_id =
-                            make_drawer_id(&wing, &room, &source_file, mem.chunk_index as usize);
-                        buffer.push(DrawerRecord {
-                            id: drawer_id,
-                            content: mem.content.clone(),
-                            metadata: DrawerMetadata {
-                                wing: Some(wing.clone()),
-                                room: Some(room),
-                                source_file: Some(source_file.clone()),
-                                ..DrawerMetadata::default()
-                            },
-                        });
+                        let room = memory_type_to_room(&mem.memory_type);
+                        *stats.room_counts.entry(room.to_string()).or_insert(0) += 1;
                     }
+                    stats.drawers_filed += memories.len();
+                    stats.files_processed += 1;
                 }
             }
-
-            stats.files_processed += 1;
-
-            while buffer.len() >= BATCH_SIZE {
-                let rest = buffer.split_off(BATCH_SIZE);
-                let flushed = buffer.len();
-                palace
-                    .add_many(std::mem::replace(&mut buffer, rest))
-                    .map_err(ConvoMineError::Palace)?;
-                stats.drawers_filed += flushed;
-            }
         }
-
-        if !buffer.is_empty() {
-            let flushed = buffer.len();
-            palace
-                .add_many(buffer)
-                .map_err(ConvoMineError::Palace)?;
-            stats.drawers_filed += flushed;
-        }
-
         Ok(stats)
     }
+}
+
+/// File-level outcome event for the convo producer.
+#[derive(Debug, Clone)]
+enum ConvoFileStat {
+    Processed,
+    ProcessedWithRoom(String),
+    Skipped,
 }
 
 impl Default for ConvoMiner {

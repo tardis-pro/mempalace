@@ -31,15 +31,18 @@ mod tests {
     }
 
     #[test]
-    fn version_matches_legacy_pyproject() {
+    fn version_matches_workspace_cargo_toml() {
         let body = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../legacy/pyproject.toml"),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml"),
         )
         .unwrap();
-        let line = body.lines().find(|l| l.starts_with("version")).unwrap();
+        let version_line = body
+            .lines()
+            .find(|l| l.trim().starts_with("version") && l.contains('"'))
+            .expect("workspace Cargo.toml must have a quoted version line");
         assert!(
-            line.contains(VERSION),
-            "legacy/pyproject.toml version line `{line}` does not contain Rust VERSION `{VERSION}`"
+            version_line.contains(VERSION),
+            "workspace Cargo.toml version `{version_line}` does not contain VERSION `{VERSION}`"
         );
     }
 }

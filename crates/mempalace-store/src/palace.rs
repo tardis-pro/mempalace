@@ -96,6 +96,27 @@ pub trait Palace: std::fmt::Debug + Send + Sync {
         }
         Ok(())
     }
+
+    /// Bulk insert when the caller has already guaranteed no ids in the
+    /// batch collide with existing rows (typically via a global per-wing
+    /// pre-pass scan). Backends that do a per-batch duplicate SELECT in
+    /// [`Palace::add_many`] can skip it here. Default: delegates to
+    /// [`Palace::add_many`].
+    fn add_many_prededuped(&mut self, records: Vec<DrawerRecord>) -> Result<()> {
+        self.add_many(records)
+    }
+
+    fn load_existing_ids_for_wing(&self, _wing: &str) -> Result<std::collections::HashSet<String>> {
+        Ok(std::collections::HashSet::new())
+    }
+
+    fn rebuild_vector_index(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 // ── In-memory reference backend ─────────────────────────────────────────

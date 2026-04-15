@@ -27,6 +27,8 @@ ignore.workspace = true
 sha2.workspace = true
 regex.workspace = true
 rusqlite.workspace = true
+crossbeam-channel = "0.5"
+rayon = "1"
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -23,6 +23,7 @@ rusqlite.workspace = true
 tokio.workspace = true
 lancedb.workspace = true
 fastembed.workspace = true
+ort.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
 futures.workspace = true

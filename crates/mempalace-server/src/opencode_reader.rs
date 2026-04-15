@@ -23,7 +23,7 @@ use thiserror::Error;
 
 pub const MIN_CHUNK_SIZE: usize = 80;
 pub const MAX_CHUNK_CHARS: usize = 2000;
-const BATCH_SIZE: usize = 64;
+const BATCH_SIZE: usize = 1024;
 
 #[derive(Debug, Error)]
 pub enum OpencodeError {
@@ -128,6 +128,7 @@ fn mine_from_sqlite(
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )?;
 
+    let existing_ids = palace.load_existing_ids_for_wing(wing).unwrap_or_default();
     let mut stats = OpencodeMineStats::default();
     let mut buffer: Vec<DrawerRecord> = Vec::with_capacity(BATCH_SIZE);
 
@@ -153,8 +154,7 @@ fn mine_from_sqlite(
         let (session_id, title, directory) = session_row?;
         stats.sessions_scanned += 1;
 
-        let transcript =
-            build_sqlite_transcript(&conn, &session_id, title.as_deref(), &mut stats)?;
+        let transcript = build_sqlite_transcript(&conn, &session_id, title.as_deref(), &mut stats)?;
         if transcript.trim().len() < MIN_CHUNK_SIZE {
             continue;
         }
@@ -170,6 +170,9 @@ fn mine_from_sqlite(
                 continue;
             }
             let drawer_id = make_drawer_id(&session_id, idx, &chunk);
+            if existing_ids.contains(&drawer_id) {
+                continue;
+            }
             buffer.push(DrawerRecord {
                 id: drawer_id,
                 content: chunk,
@@ -188,16 +191,17 @@ fn mine_from_sqlite(
         while buffer.len() >= BATCH_SIZE {
             let rest = buffer.split_off(BATCH_SIZE);
             let flushed = buffer.len();
-            palace.add_many(std::mem::replace(&mut buffer, rest))?;
+            palace.add_many_prededuped(std::mem::replace(&mut buffer, rest))?;
             stats.drawers_filed += flushed;
         }
     }
 
     if !buffer.is_empty() {
         let flushed = buffer.len();
-        palace.add_many(buffer)?;
+        palace.add_many_prededuped(buffer)?;
         stats.drawers_filed += flushed;
     }
+    palace.flush()?;
 
     Ok(stats)
 }
@@ -371,6 +375,7 @@ fn mine_from_files(
     let message_root = storage_root.join("message");
     let part_root = storage_root.join("part");
 
+    let existing_ids = palace.load_existing_ids_for_wing(wing).unwrap_or_default();
     let mut stats = OpencodeMineStats::default();
     let mut buffer: Vec<DrawerRecord> = Vec::with_capacity(BATCH_SIZE);
 
@@ -400,8 +405,7 @@ fn mine_from_files(
                 Err(_) => continue,
             };
 
-            let transcript =
-                build_file_transcript(&session, &message_root, &part_root, &mut stats);
+            let transcript = build_file_transcript(&session, &message_root, &part_root, &mut stats);
             if transcript.trim().len() < MIN_CHUNK_SIZE {
                 continue;
             }
@@ -417,6 +421,9 @@ fn mine_from_files(
                     continue;
                 }
                 let drawer_id = make_drawer_id(&session.id, idx, &chunk);
+                if existing_ids.contains(&drawer_id) {
+                    continue;
+                }
                 buffer.push(DrawerRecord {
                     id: drawer_id,
                     content: chunk,
@@ -435,7 +442,7 @@ fn mine_from_files(
             while buffer.len() >= BATCH_SIZE {
                 let rest = buffer.split_off(BATCH_SIZE);
                 let flushed = buffer.len();
-                palace.add_many(std::mem::replace(&mut buffer, rest))?;
+                palace.add_many_prededuped(std::mem::replace(&mut buffer, rest))?;
                 stats.drawers_filed += flushed;
             }
         }
@@ -443,9 +450,10 @@ fn mine_from_files(
 
     if !buffer.is_empty() {
         let flushed = buffer.len();
-        palace.add_many(buffer)?;
+        palace.add_many_prededuped(buffer)?;
         stats.drawers_filed += flushed;
     }
+    palace.flush()?;
 
     Ok(stats)
 }

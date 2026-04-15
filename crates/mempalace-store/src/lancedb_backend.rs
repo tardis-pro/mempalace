@@ -40,32 +40,75 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use fs2::FileExt;
 use futures::TryStreamExt;
+use lancedb::index::vector::IvfPqIndexBuilder;
+use lancedb::index::IndexType;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::{Connection, DistanceType, Table};
 use tokio::runtime::{Handle, Runtime};
 use tracing::debug;
+use tracing::warn;
 
 use crate::palace::{
     DrawerMetadata, DrawerRecord, Palace, PalaceError, Result, SearchFilter, SearchResult,
 };
 
-/// Embedding dimensionality for `AllMiniLML6V2`.
 pub const EMBEDDING_DIM: i32 = 384;
-
-/// Default table name used by [`LanceDbPalace::new`].
 pub const DEFAULT_TABLE_NAME: &str = "mempalace_drawers";
 
+const ORT_DYLIB_SEARCH_PATHS: &[&str] = &["/home/pronit/.local/lib/onnxruntime/libonnxruntime.so"];
+
+fn ensure_ort_dylib() {
+    if std::env::var("ORT_DYLIB_PATH").is_ok() {
+        return;
+    }
+    for path in ORT_DYLIB_SEARCH_PATHS {
+        if std::path::Path::new(path).exists() {
+            std::env::set_var("ORT_DYLIB_PATH", path);
+            return;
+        }
+    }
+}
+
+fn init_embedder() -> Result<(TextEmbedding, bool)> {
+    ensure_ort_dylib();
+
+    let cuda_ep = ort::ep::CUDA::default().with_device_id(0).build();
+    let cpu_ep = ort::ep::CPU::default().build();
+    let opts = InitOptions::new(EmbeddingModel::AllMiniLML6V2)
+        .with_execution_providers(vec![cuda_ep, cpu_ep]);
+    match TextEmbedding::try_new(opts) {
+        Ok(emb) => {
+            debug!("initialized embedder with CUDA + CPU fallback");
+            Ok((emb, true))
+        }
+        Err(e) => {
+            warn!("CUDA init failed ({e}), trying CPU-only");
+            let cpu_opts = InitOptions::new(EmbeddingModel::AllMiniLML6V2)
+                .with_execution_providers(vec![ort::ep::CPU::default().build()]);
+            let emb = TextEmbedding::try_new(cpu_opts)
+                .map_err(|e| PalaceError::Backend(format!("embedder init failed: {e}")))?;
+            Ok((emb, false))
+        }
+    }
+}
+
 /// Real, persistent [`Palace`] backed by `lancedb` + `fastembed`.
+/// Minimum row count before we build an IVF_PQ vector index. Below this
+/// threshold, brute-force is fast enough and training data is too sparse
+/// for meaningful partitions.
+const VECTOR_INDEX_MIN_ROWS: usize = 1_000;
+
 pub struct LanceDbPalace {
     runtime: Runtime,
     connection: Connection,
     table: Table,
     embedder: Mutex<TextEmbedding>,
     next_seq: Mutex<i64>,
+    schema: SchemaRef,
     table_name: String,
-    /// Exclusive file lock held for the lifetime of this handle. Ensures at
-    /// most one writer per palace directory across processes on the same
-    /// host. Released automatically on drop.
+    has_vector_index: bool,
+    using_gpu: bool,
+    pending_write: Option<tokio::task::JoinHandle<std::result::Result<(), String>>>,
     #[allow(dead_code)]
     lock_file: File,
 }
@@ -80,8 +123,7 @@ impl std::fmt::Debug for LanceDbPalace {
 
 impl Drop for LanceDbPalace {
     fn drop(&mut self) {
-        // The fs2 lock releases automatically when `lock_file` is dropped.
-        // We just remove the pid marker as a courtesy.
+        let _ = self.drain_pending_write();
         let _ = FileExt::unlock(&self.lock_file);
     }
 }
@@ -158,7 +200,7 @@ impl LanceDbPalace {
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
-            .worker_threads(2)
+            .worker_threads(4)
             .thread_name("mempalace-lancedb")
             .build()
             .map_err(|e| PalaceError::Backend(format!("failed to build tokio runtime: {e}")))?;
@@ -171,7 +213,7 @@ impl LanceDbPalace {
 
         let schema = build_schema();
 
-        let (connection, table) = runtime.block_on(async {
+        let (connection, table, indices) = runtime.block_on(async {
             let conn = lancedb::connect(&path_str)
                 .execute()
                 .await
@@ -218,23 +260,88 @@ impl LanceDbPalace {
                     )
                     .execute()
                     .await
-                    .map_err(|e| {
-                        PalaceError::Backend(format!("create id index failed: {e}"))
-                    })?;
+                    .map_err(|e| PalaceError::Backend(format!("create id index failed: {e}")))?;
             }
 
-            Ok::<_, PalaceError>((conn, table))
+            // BTree scalar index on `wing` for fast metadata filtering in
+            // search (prefilter) and load_existing_ids_for_wing pre-pass.
+            let has_wing_index = indices
+                .iter()
+                .any(|cfg| cfg.columns.len() == 1 && cfg.columns[0] == "wing");
+            if !has_wing_index {
+                debug!("creating BTree scalar index on wing column (first run)");
+                table
+                    .create_index(
+                        &["wing"],
+                        lancedb::index::Index::BTree(
+                            lancedb::index::scalar::BTreeIndexBuilder::default(),
+                        ),
+                    )
+                    .execute()
+                    .await
+                    .map_err(|e| PalaceError::Backend(format!("create wing index failed: {e}")))?;
+            }
+
+            Ok::<_, PalaceError>((conn, table, indices))
         })?;
 
-        let embedder = TextEmbedding::try_new(InitOptions::new(EmbeddingModel::AllMiniLML6V2))
-            .map_err(|e| PalaceError::Backend(format!("fastembed init failed: {e}")))?;
+        let has_vector_index = indices.iter().any(|cfg| {
+            matches!(
+                cfg.index_type,
+                IndexType::IvfPq
+                    | IndexType::IvfHnswSq
+                    | IndexType::IvfHnswPq
+                    | IndexType::IvfFlat
+                    | IndexType::IvfSq
+            )
+        });
 
-        // Recover the max insert_seq so new rows continue the sequence across restarts.
+        let (embedder, using_gpu) = init_embedder()?;
+
         let next_seq = runtime.block_on(async { scan_max_seq(&table).await })?;
+
+        if !has_vector_index {
+            let row_count = runtime.block_on(async {
+                table
+                    .count_rows(None)
+                    .await
+                    .map_err(|e| PalaceError::Backend(format!("count_rows failed: {e}")))
+            })?;
+            if row_count >= VECTOR_INDEX_MIN_ROWS {
+                debug!(
+                    row_count,
+                    "building IVF_PQ vector index (first run on existing data)"
+                );
+                runtime.block_on(async {
+                    table
+                        .create_index(
+                            &["vector"],
+                            lancedb::index::Index::IvfPq(
+                                IvfPqIndexBuilder::default()
+                                    .distance_type(DistanceType::Cosine)
+                                    .num_partitions(std::cmp::max(1, (row_count / 4096) as u32))
+                                    .num_sub_vectors(EMBEDDING_DIM as u32 / 16),
+                            ),
+                        )
+                        .execute()
+                        .await
+                        .map_err(|e| {
+                            PalaceError::Backend(format!("create vector index failed: {e}"))
+                        })
+                })?;
+            }
+        }
+
+        let has_vector_index = has_vector_index || {
+            runtime.block_on(async { table.count_rows(None).await.unwrap_or(0) })
+                >= VECTOR_INDEX_MIN_ROWS
+        };
 
         debug!(
             table = %table_name_owned,
             next_seq = next_seq,
+            has_vector_index,
+            using_gpu,
             "LanceDbPalace opened"
         );
 
@@ -244,9 +351,23 @@ impl LanceDbPalace {
             table,
             embedder: Mutex::new(embedder),
             next_seq: Mutex::new(next_seq),
+            schema,
             table_name: table_name_owned,
+            has_vector_index,
+            using_gpu,
+            pending_write: None,
             lock_file,
         })
+    }
+
+    fn drain_pending_write(&mut self) -> Result<()> {
+        if let Some(handle) = self.pending_write.take() {
+            self.runtime
+                .block_on(handle)
+                .map_err(|e| PalaceError::Backend(format!("pending write task panicked: {e}")))?
+                .map_err(|e| PalaceError::Backend(e))?;
+        }
+        Ok(())
     }
 
     fn embed_one(&self, text: &str) -> Result<Vec<f32>> {
@@ -273,8 +394,13 @@ impl LanceDbPalace {
             .embedder
             .lock()
             .map_err(|e| PalaceError::Backend(format!("embedder mutex poisoned: {e}")))?;
+        // Sub-batch hint for fastembed's internal chunking. 256 is big
+        // enough to amortise tokenizer + session overhead across a flush
+        // (vs. the previous 64 which turned each 1024-row flush into 16
+        // tiny ONNX calls). MiniLM-L6 at batch=256 fits comfortably in
+        // ORT's arena on a 32-core box.
         guard
-            .embed(texts, Some(64))
+            .embed(texts, Some(256))
             .map_err(|e| PalaceError::Backend(format!("fastembed batch embed failed: {e}")))
     }
 
@@ -482,7 +608,7 @@ fn row_similarity(batch: &RecordBatch, row: usize) -> Result<f64> {
 
 fn build_insert_batch_many(
     schema: SchemaRef,
-    records: &[DrawerRecord],
+    records: Vec<DrawerRecord>,
     vectors: Vec<Vec<f32>>,
     seqs: &[i64],
 ) -> Result<RecordBatch> {
@@ -504,74 +630,57 @@ fn build_insert_batch_many(
         }
     }
 
-    let id = Arc::new(StringArray::from(
-        records.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
-    )) as Arc<dyn Array>;
-    let content = Arc::new(StringArray::from(
-        records.iter().map(|r| r.content.clone()).collect::<Vec<_>>(),
-    )) as Arc<dyn Array>;
+    let mut ids: Vec<String> = Vec::with_capacity(records.len());
+    let mut contents: Vec<String> = Vec::with_capacity(records.len());
+    let mut wings: Vec<Option<String>> = Vec::with_capacity(records.len());
+    let mut rooms: Vec<Option<String>> = Vec::with_capacity(records.len());
+    let mut halls: Vec<Option<String>> = Vec::with_capacity(records.len());
+    let mut source_files: Vec<Option<String>> = Vec::with_capacity(records.len());
+    let mut dates: Vec<Option<String>> = Vec::with_capacity(records.len());
+    let mut importances: Vec<Option<f64>> = Vec::with_capacity(records.len());
+    let mut extras: Vec<Option<String>> = Vec::with_capacity(records.len());
+
+    for r in records {
+        ids.push(r.id);
+        contents.push(r.content);
+        wings.push(r.metadata.wing);
+        rooms.push(r.metadata.room);
+        halls.push(r.metadata.hall);
+        source_files.push(r.metadata.source_file);
+        dates.push(r.metadata.date);
+        importances.push(r.metadata.importance);
+        let extra =
+            if r.metadata.extra.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&r.metadata.extra).map_err(|e| {
+                    PalaceError::Backend(format!("extra_json serialize failed: {e}"))
+                })?)
+            };
+        extras.push(extra);
+    }
+
+    let id = Arc::new(StringArray::from(ids)) as Arc<dyn Array>;
+    let content = Arc::new(StringArray::from(contents)) as Arc<dyn Array>;
 
     let vector_rows: Vec<Option<Vec<Option<f32>>>> = vectors
         .into_iter()
         .map(|v| Some(v.into_iter().map(Some).collect()))
         .collect();
-    let vector_array =
-        FixedSizeListArray::from_iter_primitive::<arrow_array::types::Float32Type, _, _>(
-            vector_rows.into_iter(),
-            EMBEDDING_DIM,
-        );
+    let vector_array = FixedSizeListArray::from_iter_primitive::<
+        arrow_array::types::Float32Type,
+        _,
+        _,
+    >(vector_rows.into_iter(), EMBEDDING_DIM);
     let vector: Arc<dyn Array> = Arc::new(vector_array);
 
-    let wing = Arc::new(StringArray::from(
-        records
-            .iter()
-            .map(|r| r.metadata.wing.clone())
-            .collect::<Vec<_>>(),
-    )) as Arc<dyn Array>;
-    let room = Arc::new(StringArray::from(
-        records
-            .iter()
-            .map(|r| r.metadata.room.clone())
-            .collect::<Vec<_>>(),
-    )) as Arc<dyn Array>;
-    let hall = Arc::new(StringArray::from(
-        records
-            .iter()
-            .map(|r| r.metadata.hall.clone())
-            .collect::<Vec<_>>(),
-    )) as Arc<dyn Array>;
-    let source_file = Arc::new(StringArray::from(
-        records
-            .iter()
-            .map(|r| r.metadata.source_file.clone())
-            .collect::<Vec<_>>(),
-    )) as Arc<dyn Array>;
-    let date = Arc::new(StringArray::from(
-        records
-            .iter()
-            .map(|r| r.metadata.date.clone())
-            .collect::<Vec<_>>(),
-    )) as Arc<dyn Array>;
-    let importance = Arc::new(Float64Array::from(
-        records
-            .iter()
-            .map(|r| r.metadata.importance)
-            .collect::<Vec<_>>(),
-    )) as Arc<dyn Array>;
-
-    let extra_json_col: Vec<Option<String>> = records
-        .iter()
-        .map(|r| {
-            if r.metadata.extra.is_empty() {
-                Ok(None)
-            } else {
-                serde_json::to_string(&r.metadata.extra)
-                    .map(Some)
-                    .map_err(|e| PalaceError::Backend(format!("extra_json serialize failed: {e}")))
-            }
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let extra_json = Arc::new(StringArray::from(extra_json_col)) as Arc<dyn Array>;
+    let wing = Arc::new(StringArray::from(wings)) as Arc<dyn Array>;
+    let room = Arc::new(StringArray::from(rooms)) as Arc<dyn Array>;
+    let hall = Arc::new(StringArray::from(halls)) as Arc<dyn Array>;
+    let source_file = Arc::new(StringArray::from(source_files)) as Arc<dyn Array>;
+    let date = Arc::new(StringArray::from(dates)) as Arc<dyn Array>;
+    let importance = Arc::new(Float64Array::from(importances)) as Arc<dyn Array>;
+    let extra_json = Arc::new(StringArray::from(extras)) as Arc<dyn Array>;
 
     let insert_seq = Arc::new(Int64Array::from(seqs.to_vec())) as Arc<dyn Array>;
 
@@ -684,7 +793,7 @@ impl Palace for LanceDbPalace {
 
         let vector = self.embed_one(&record.content)?;
         let seq = self.bump_seq()?;
-        let schema = build_schema();
+        let schema = self.schema.clone();
         let batch = build_insert_batch(schema.clone(), &record, vector, seq)?;
 
         let reader: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(
@@ -725,6 +834,7 @@ impl Palace for LanceDbPalace {
         if records.is_empty() {
             return Ok(());
         }
+        self.drain_pending_write()?;
 
         // Stage 1: in-batch dedup.
         let mut seen_in_batch: std::collections::HashSet<String> =
@@ -751,31 +861,30 @@ impl Palace for LanceDbPalace {
             .join(",");
         let filter = format!("id IN ({in_clause})");
 
-        let existing_ids: std::collections::HashSet<String> =
-            self.runtime.block_on(async {
-                let stream = self
-                    .table
-                    .query()
-                    .only_if(filter)
-                    .select(lancedb::query::Select::columns(&["id"]))
-                    .execute()
-                    .await
-                    .map_err(|e| {
-                        PalaceError::Backend(format!("add_many prefilter query failed: {e}"))
-                    })?;
-                let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(|e| {
-                    PalaceError::Backend(format!("add_many prefilter collect failed: {e}"))
+        let existing_ids: std::collections::HashSet<String> = self.runtime.block_on(async {
+            let stream = self
+                .table
+                .query()
+                .only_if(filter)
+                .select(lancedb::query::Select::columns(&["id"]))
+                .execute()
+                .await
+                .map_err(|e| {
+                    PalaceError::Backend(format!("add_many prefilter query failed: {e}"))
                 })?;
-                let mut set = std::collections::HashSet::new();
-                for b in &batches {
-                    for row in 0..b.num_rows() {
-                        if let Some(id) = read_string(b, "id", row)? {
-                            set.insert(id);
-                        }
+            let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(|e| {
+                PalaceError::Backend(format!("add_many prefilter collect failed: {e}"))
+            })?;
+            let mut set = std::collections::HashSet::new();
+            for b in &batches {
+                for row in 0..b.num_rows() {
+                    if let Some(id) = read_string(b, "id", row)? {
+                        set.insert(id);
                     }
                 }
-                Ok::<_, PalaceError>(set)
-            })?;
+            }
+            Ok::<_, PalaceError>(set)
+        })?;
 
         let fresh: Vec<DrawerRecord> = staged
             .into_iter()
@@ -797,8 +906,8 @@ impl Palace for LanceDbPalace {
         }
 
         let seqs = self.bump_seq_many(fresh.len())?;
-        let schema = build_schema();
-        let batch = build_insert_batch_many(schema.clone(), &fresh, vectors, &seqs)?;
+        let schema = self.schema.clone();
+        let batch = build_insert_batch_many(schema.clone(), fresh, vectors, &seqs)?;
 
         let reader: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(
             RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema),
@@ -816,7 +925,151 @@ impl Palace for LanceDbPalace {
         })
     }
 
+    /// Fast path for bulk insert when the caller has already filtered out
+    /// ids that exist in the table (typically via a global per-wing
+    /// pre-pass). Skips the per-batch `id IN (...)` SELECT that
+    /// [`Palace::add_many`] does, which is pure overhead here.
+    ///
+    /// Still does:
+    /// - in-batch HashSet dedup (cheap, catches caller-side duplicates)
+    /// - merge_insert safety net (catches concurrent-writer races)
+    ///
+    /// Measurement against v1 baseline (edtech-platform, 7470 drawers): the
+    /// per-batch SELECT was firing 117 times in the old batch=64 flow.
+    /// With batch=1024 that drops to 8, and this override drops it to 0.
+    fn add_many_prededuped(&mut self, records: Vec<DrawerRecord>) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        let mut seen_in_batch: std::collections::HashSet<String> =
+            std::collections::HashSet::with_capacity(records.len());
+        let mut staged: Vec<DrawerRecord> = Vec::with_capacity(records.len());
+        for r in records {
+            if seen_in_batch.insert(r.id.clone()) {
+                staged.push(r);
+            }
+        }
+        if staged.is_empty() {
+            return Ok(());
+        }
+
+        // Drain previous write before starting the next embed+write cycle.
+        // This ensures at most one in-flight merge_insert at any time.
+        self.drain_pending_write()?;
+
+        let t_embed = std::time::Instant::now();
+        let texts: Vec<String> = staged.iter().map(|r| r.content.clone()).collect();
+        let vectors = self.embed_many(texts)?;
+        let embed_ms = t_embed.elapsed().as_millis() as u64;
+        if vectors.len() != staged.len() {
+            return Err(PalaceError::Backend(format!(
+                "embed_many returned {} vectors for {} records",
+                vectors.len(),
+                staged.len()
+            )));
+        }
+        debug!(n = staged.len(), embed_ms, "batch embedded");
+
+        let seqs = self.bump_seq_many(staged.len())?;
+        let schema = self.schema.clone();
+        let batch = build_insert_batch_many(schema.clone(), staged, vectors, &seqs)?;
+
+        let reader: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(
+            RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema),
+        );
+
+        let table = self.table.clone();
+        self.pending_write = Some(self.runtime.spawn(async move {
+            let t_write = std::time::Instant::now();
+            let mut builder = table.merge_insert(&["id"]);
+            builder.when_not_matched_insert_all();
+            let result = builder
+                .execute(reader)
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("merge_insert failed: {e}"));
+            tracing::debug!(
+                write_ms = t_write.elapsed().as_millis() as u64,
+                "merge_insert done"
+            );
+            result
+        }));
+
+        Ok(())
+    }
+
+    /// Load all drawer ids in the given wing, for ingest-side pre-pass
+    /// dedup. Scoped to a single wing to keep the scan bounded: largest
+    /// wing today is `convo_opencode` at ~69k rows (~250 ms). Cross-wing
+    /// dedup was never a guarantee of the current system.
+    fn load_existing_ids_for_wing(&self, wing: &str) -> Result<std::collections::HashSet<String>> {
+        let wing_escaped = escape_sql_literal(wing)?;
+        let filter = format!("wing = '{wing_escaped}'");
+        self.runtime.block_on(async {
+            let stream = self
+                .table
+                .query()
+                .only_if(filter)
+                .select(lancedb::query::Select::columns(&["id"]))
+                .execute()
+                .await
+                .map_err(|e| {
+                    PalaceError::Backend(format!("load_existing_ids_for_wing query failed: {e}"))
+                })?;
+            let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(|e| {
+                PalaceError::Backend(format!("load_existing_ids_for_wing collect failed: {e}"))
+            })?;
+            let cap: usize = batches.iter().map(|b| b.num_rows()).sum();
+            let mut set = std::collections::HashSet::with_capacity(cap);
+            for b in &batches {
+                for row in 0..b.num_rows() {
+                    if let Some(id) = read_string(b, "id", row)? {
+                        set.insert(id);
+                    }
+                }
+            }
+            Ok(set)
+        })
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.drain_pending_write()
+    }
+
+    fn rebuild_vector_index(&mut self) -> Result<()> {
+        self.drain_pending_write()?;
+        let row_count = self.runtime.block_on(async {
+            self.table
+                .count_rows(None)
+                .await
+                .map_err(|e| PalaceError::Backend(format!("count_rows failed: {e}")))
+        })?;
+        if row_count < VECTOR_INDEX_MIN_ROWS {
+            return Ok(());
+        }
+        debug!(row_count, "rebuilding IVF_PQ vector index after ingest");
+        self.runtime.block_on(async {
+            self.table
+                .create_index(
+                    &["vector"],
+                    lancedb::index::Index::IvfPq(
+                        IvfPqIndexBuilder::default()
+                            .distance_type(DistanceType::Cosine)
+                            .num_partitions(std::cmp::max(1, (row_count / 4096) as u32))
+                            .num_sub_vectors(EMBEDDING_DIM as u32 / 16),
+                    ),
+                )
+                .execute()
+                .await
+                .map_err(|e| PalaceError::Backend(format!("rebuild vector index failed: {e}")))
+        })?;
+        self.has_vector_index = true;
+        Ok(())
+    }
+
     fn delete(&mut self, id: &str) -> Result<bool> {
+        self.drain_pending_write()?;
         let id_escaped = escape_sql_literal(id)?;
         let predicate = format!("id = '{id_escaped}'");
         self.runtime.block_on(async {
@@ -960,6 +1213,7 @@ impl Palace for LanceDbPalace {
         let vector = self.embed_one(query)?;
         let where_clause = build_where_clause(filter)?;
 
+        let use_index = self.has_vector_index;
         let batches: Vec<RecordBatch> = self.runtime.block_on(async {
             let mut q = self
                 .table
@@ -968,6 +1222,9 @@ impl Palace for LanceDbPalace {
                 .map_err(|e| PalaceError::Backend(format!("nearest_to failed: {e}")))?
                 .distance_type(DistanceType::Cosine)
                 .limit(n_results);
+            if use_index {
+                q = q.nprobes(20).refine_factor(2);
+            }
             if let Some(w) = where_clause {
                 q = q.only_if(w);
             }

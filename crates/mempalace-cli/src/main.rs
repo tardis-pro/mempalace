@@ -61,7 +61,9 @@ enum Command {
         project: Vec<String>,
     },
 
-    #[command(about = "Mine a directory into the palace (project files, conversations, or opencode storage)")]
+    #[command(
+        about = "Mine a directory into the palace (project files, conversations, or opencode storage)"
+    )]
     Mine {
         dir: PathBuf,
         #[arg(long)]
@@ -110,7 +112,9 @@ enum Command {
         connect: Option<PathBuf>,
     },
 
-    #[command(about = "Run the palace daemon: one process owns the palace and accepts MCP connections over a Unix socket")]
+    #[command(
+        about = "Run the palace daemon: one process owns the palace and accepts MCP connections over a Unix socket"
+    )]
     Daemon {
         /// Unix socket path to bind. Defaults to <palace>/mempalace.sock.
         #[arg(long)]
@@ -376,8 +380,9 @@ fn cmd_mcp_serve(palace_path: Option<&Path>, connect: Option<&Path>) -> Result<(
                 format!("failed to open knowledge graph at {}", kg_path.display())
             })?
         }
-        None => KnowledgeGraph::open(":memory:")
-            .context("failed to open in-memory knowledge graph")?,
+        None => {
+            KnowledgeGraph::open(":memory:").context("failed to open in-memory knowledge graph")?
+        }
     };
 
     let server = McpServer::new(palace, kg);
@@ -391,7 +396,9 @@ fn cmd_mcp_serve(palace_path: Option<&Path>, connect: Option<&Path>) -> Result<(
 /// exclusive lock. Exits cleanly on SIGINT/SIGTERM.
 fn cmd_daemon(palace_path: Option<&Path>, socket_override: Option<&Path>) -> Result<()> {
     let palace_dir = palace_path.ok_or_else(|| {
-        anyhow::anyhow!("--palace <DIR> is required for daemon mode (in-memory palace is not shareable)")
+        anyhow::anyhow!(
+            "--palace <DIR> is required for daemon mode (in-memory palace is not shareable)"
+        )
     })?;
 
     let socket_path: PathBuf = match socket_override {
@@ -432,13 +439,11 @@ fn cmd_daemon(palace_path: Option<&Path>, socket_override: Option<&Path>) -> Res
     result
 }
 
-/// Byte-pump proxy: copy stdin → UnixStream and UnixStream → stdout until
-/// either side closes. Used by `mempalace mcp-serve --connect <socket>` so
-/// that agents spawning a fresh `mcp-serve` per session all talk to the
-/// single long-running daemon.
 fn run_mcp_proxy(socket_path: &Path) -> Result<()> {
     let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
     rt.block_on(async move {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
         let stream = tokio::net::UnixStream::connect(socket_path)
             .await
             .with_context(|| {
@@ -447,16 +452,50 @@ fn run_mcp_proxy(socket_path: &Path) -> Result<()> {
                     socket_path.display()
                 )
             })?;
-        let (mut rsock, mut wsock) = stream.into_split();
-        let mut stdin = tokio::io::stdin();
+        let (rsock, mut wsock) = stream.into_split();
+        let stdin = tokio::io::stdin();
         let mut stdout = tokio::io::stdout();
+        let mut stdin_lines = BufReader::new(stdin).lines();
+        let mut rsock_lines = BufReader::new(rsock).lines();
 
-        let up = async {
-            let _ = tokio::io::copy(&mut stdin, &mut wsock).await;
+        // MCP handshake gate: rmcp drops messages arriving before the session
+        // transitions to "initialized". Forward the initialize request, wait
+        // for the response, then switch to raw bidirectional relay.
+        let init_done = std::sync::Arc::new(tokio::sync::Notify::new());
+
+        let init_done_up = std::sync::Arc::clone(&init_done);
+        let up = async move {
+            let mut handshake_done = false;
+            while let Ok(Some(line)) = stdin_lines.next_line().await {
+                let is_init = !handshake_done
+                    && line.contains("\"initialize\"")
+                    && !line.contains("initialized");
+                let waiter = if is_init {
+                    Some(init_done_up.notified())
+                } else {
+                    None
+                };
+                let _ = wsock.write_all(line.as_bytes()).await;
+                let _ = wsock.write_all(b"\n").await;
+                let _ = wsock.flush().await;
+                if let Some(w) = waiter {
+                    w.await;
+                    handshake_done = true;
+                }
+            }
             let _ = wsock.shutdown().await;
         };
-        let down = async {
-            let _ = tokio::io::copy(&mut rsock, &mut stdout).await;
+        let down = async move {
+            let mut first_response = true;
+            while let Ok(Some(line)) = rsock_lines.next_line().await {
+                let _ = stdout.write_all(line.as_bytes()).await;
+                let _ = stdout.write_all(b"\n").await;
+                let _ = stdout.flush().await;
+                if first_response {
+                    init_done.notify_one();
+                    first_response = false;
+                }
+            }
         };
         tokio::join!(up, down);
         Ok::<(), anyhow::Error>(())
