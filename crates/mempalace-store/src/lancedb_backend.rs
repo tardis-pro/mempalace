@@ -8,10 +8,11 @@
 //!
 //! - The [`Palace`] trait is **synchronous**, but `lancedb` is fully async.
 //!   We solve this by owning a dedicated `tokio::runtime::Runtime` inside
-//!   the struct and calling `runtime.block_on(...)` from each trait method.
-//!   To avoid the classic "block_on inside a running runtime" panic, the
-//!   constructor refuses to build if the caller is already inside a tokio
-//!   runtime (`Handle::try_current().is_ok()`).
+//!   the struct.  Trait methods call `rt_block_on(...)`, which detects
+//!   whether the current thread is already inside a tokio runtime (e.g.
+//!   the daemon's async MCP handler) and wraps the call in
+//!   `tokio::task::block_in_place` when it is.  This avoids the classic
+//!   "Cannot start a runtime from within a runtime" panic.
 //!
 //! - Embeddings use `fastembed` 5 with `AllMiniLML6V2` (384 dim).
 //!
@@ -360,10 +361,22 @@ impl LanceDbPalace {
         })
     }
 
+    /// Run a future on the palace's dedicated runtime.  When the current
+    /// thread is already inside a tokio runtime (e.g. the daemon's async MCP
+    /// handler), wraps the call in [`tokio::task::block_in_place`] so the
+    /// outer scheduler can move work off this thread.  Otherwise calls
+    /// `block_on` directly (CLI / mining paths that run before any runtime).
+    fn rt_block_on<F: std::future::Future>(&self, f: F) -> F::Output {
+        if Handle::try_current().is_ok() {
+            tokio::task::block_in_place(|| self.runtime.block_on(f))
+        } else {
+            self.runtime.block_on(f)
+        }
+    }
+
     fn drain_pending_write(&mut self) -> Result<()> {
         if let Some(handle) = self.pending_write.take() {
-            self.runtime
-                .block_on(handle)
+            self.rt_block_on(handle)
                 .map_err(|e| PalaceError::Backend(format!("pending write task panicked: {e}")))?
                 .map_err(|e| PalaceError::Backend(e))?;
         }
@@ -769,7 +782,7 @@ fn build_insert_batch(
 
 impl Palace for LanceDbPalace {
     fn count(&self) -> Result<usize> {
-        self.runtime.block_on(async {
+        self.rt_block_on(async {
             self.table
                 .count_rows(None)
                 .await
@@ -781,7 +794,7 @@ impl Palace for LanceDbPalace {
         // Pre-check for duplicate id — lancedb does not enforce primary keys.
         let id_escaped = escape_sql_literal(&record.id)?;
         let filter = format!("id = '{id_escaped}'");
-        let existing = self.runtime.block_on(async {
+        let existing = self.rt_block_on(async {
             self.table
                 .count_rows(Some(filter.clone()))
                 .await
@@ -800,7 +813,7 @@ impl Palace for LanceDbPalace {
             RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema),
         );
 
-        self.runtime.block_on(async {
+        self.rt_block_on(async {
             self.table
                 .add(reader)
                 .execute()
@@ -861,7 +874,7 @@ impl Palace for LanceDbPalace {
             .join(",");
         let filter = format!("id IN ({in_clause})");
 
-        let existing_ids: std::collections::HashSet<String> = self.runtime.block_on(async {
+        let existing_ids: std::collections::HashSet<String> = self.rt_block_on(async {
             let stream = self
                 .table
                 .query()
@@ -914,7 +927,7 @@ impl Palace for LanceDbPalace {
         );
 
         // Stage 3: merge_insert as safety net for concurrent writers.
-        self.runtime.block_on(async {
+        self.rt_block_on(async {
             let mut builder = self.table.merge_insert(&["id"]);
             builder.when_not_matched_insert_all();
             builder
@@ -1006,7 +1019,7 @@ impl Palace for LanceDbPalace {
     fn load_existing_ids_for_wing(&self, wing: &str) -> Result<std::collections::HashSet<String>> {
         let wing_escaped = escape_sql_literal(wing)?;
         let filter = format!("wing = '{wing_escaped}'");
-        self.runtime.block_on(async {
+        self.rt_block_on(async {
             let stream = self
                 .table
                 .query()
@@ -1039,7 +1052,7 @@ impl Palace for LanceDbPalace {
 
     fn rebuild_vector_index(&mut self) -> Result<()> {
         self.drain_pending_write()?;
-        let row_count = self.runtime.block_on(async {
+        let row_count = self.rt_block_on(async {
             self.table
                 .count_rows(None)
                 .await
@@ -1049,7 +1062,7 @@ impl Palace for LanceDbPalace {
             return Ok(());
         }
         debug!(row_count, "rebuilding IVF_PQ vector index after ingest");
-        self.runtime.block_on(async {
+        self.rt_block_on(async {
             self.table
                 .create_index(
                     &["vector"],
@@ -1072,7 +1085,7 @@ impl Palace for LanceDbPalace {
         self.drain_pending_write()?;
         let id_escaped = escape_sql_literal(id)?;
         let predicate = format!("id = '{id_escaped}'");
-        self.runtime.block_on(async {
+        self.rt_block_on(async {
             let before = self
                 .table
                 .count_rows(Some(predicate.clone()))
@@ -1092,7 +1105,7 @@ impl Palace for LanceDbPalace {
     fn get(&self, id: &str) -> Result<Option<DrawerRecord>> {
         let id_escaped = escape_sql_literal(id)?;
         let filter = format!("id = '{id_escaped}'");
-        let batches: Vec<RecordBatch> = self.runtime.block_on(async {
+        let batches: Vec<RecordBatch> = self.rt_block_on(async {
             let stream = self
                 .table
                 .query()
@@ -1122,7 +1135,7 @@ impl Palace for LanceDbPalace {
         }
 
         // Collect records with their insert_seq, sort, then slice.
-        let batches: Vec<RecordBatch> = self.runtime.block_on(async {
+        let batches: Vec<RecordBatch> = self.rt_block_on(async {
             let stream = self
                 .table
                 .query()
@@ -1143,7 +1156,7 @@ impl Palace for LanceDbPalace {
             if total_rows(&batches) < want {
                 batches
             } else {
-                self.runtime.block_on(async {
+                self.rt_block_on(async {
                     let stream =
                         self.table.query().execute().await.map_err(|e| {
                             PalaceError::Backend(format!("list rescan failed: {e}"))
@@ -1174,7 +1187,7 @@ impl Palace for LanceDbPalace {
 
     fn list_filtered(&self, filter: &SearchFilter, limit: usize) -> Result<Vec<DrawerRecord>> {
         let where_clause = build_where_clause(filter)?;
-        let batches: Vec<RecordBatch> = self.runtime.block_on(async {
+        let batches: Vec<RecordBatch> = self.rt_block_on(async {
             let mut q = self.table.query();
             if let Some(w) = where_clause {
                 q = q.only_if(w);
@@ -1214,7 +1227,7 @@ impl Palace for LanceDbPalace {
         let where_clause = build_where_clause(filter)?;
 
         let use_index = self.has_vector_index;
-        let batches: Vec<RecordBatch> = self.runtime.block_on(async {
+        let batches: Vec<RecordBatch> = self.rt_block_on(async {
             let mut q = self
                 .table
                 .query()

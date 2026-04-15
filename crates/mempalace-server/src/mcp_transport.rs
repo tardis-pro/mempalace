@@ -27,6 +27,9 @@ use crate::mcp::{AddDrawerRequest, McpServer};
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct EmptyParams {}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 struct SearchParams {
     query: String,
     wing: Option<String>,
@@ -170,16 +173,22 @@ pub async fn serve_unix_socket(server: McpServer, socket_path: &Path) -> anyhow:
     // Remove stale socket file from a previous daemon run. `bind` will
     // otherwise fail with "Address already in use".
     if socket_path.exists() {
-        std::fs::remove_file(socket_path)
-            .map_err(|e| anyhow::anyhow!("failed to remove stale socket {}: {e}", socket_path.display()))?;
+        std::fs::remove_file(socket_path).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to remove stale socket {}: {e}",
+                socket_path.display()
+            )
+        })?;
     }
     if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| anyhow::anyhow!("failed to create socket parent {}: {e}", parent.display()))?;
+        std::fs::create_dir_all(parent).map_err(|e| {
+            anyhow::anyhow!("failed to create socket parent {}: {e}", parent.display())
+        })?;
     }
 
-    let listener = UnixListener::bind(socket_path)
-        .map_err(|e| anyhow::anyhow!("failed to bind unix socket {}: {e}", socket_path.display()))?;
+    let listener = UnixListener::bind(socket_path).map_err(|e| {
+        anyhow::anyhow!("failed to bind unix socket {}: {e}", socket_path.display())
+    })?;
 
     // Tighten permissions to owner-only. Best-effort; if it fails we still run.
     #[cfg(unix)]
@@ -236,7 +245,7 @@ fn build_router(inner: Arc<McpServer>) -> Router<MempalaceMcp> {
             })
             .name("mempalace_status")
             .description("Show palace status: version, drawer count, tools registered, AAAK spec")
-            .parameters::<serde_json::Value>()
+            .parameters::<EmptyParams>()
         })
         // mempalace_search
         .with_tool({
@@ -266,7 +275,7 @@ fn build_router(inner: Arc<McpServer>) -> Router<MempalaceMcp> {
             })
             .name("mempalace_list_wings")
             .description("List all wings and their drawer counts")
-            .parameters::<serde_json::Value>()
+            .parameters::<EmptyParams>()
         })
         // mempalace_list_rooms
         .with_tool({
@@ -290,7 +299,7 @@ fn build_router(inner: Arc<McpServer>) -> Router<MempalaceMcp> {
             })
             .name("mempalace_get_taxonomy")
             .description("Get full taxonomy: wings, rooms, and drawer counts")
-            .parameters::<serde_json::Value>()
+            .parameters::<EmptyParams>()
         })
         // mempalace_check_duplicate
         .with_tool({
@@ -312,7 +321,7 @@ fn build_router(inner: Arc<McpServer>) -> Router<MempalaceMcp> {
             })
             .name("mempalace_get_aaak_spec")
             .description("Return the AAAK (At-A-Glance Key) dialect specification")
-            .parameters::<serde_json::Value>()
+            .parameters::<EmptyParams>()
         })
         // mempalace_add_drawer
         .with_tool({
@@ -404,7 +413,7 @@ fn build_router(inner: Arc<McpServer>) -> Router<MempalaceMcp> {
             })
             .name("mempalace_kg_stats")
             .description("Get knowledge graph statistics")
-            .parameters::<serde_json::Value>()
+            .parameters::<EmptyParams>()
         })
         // mempalace_traverse
         .with_tool({
@@ -440,6 +449,6 @@ fn build_router(inner: Arc<McpServer>) -> Router<MempalaceMcp> {
             })
             .name("mempalace_graph_stats")
             .description("Get palace graph statistics (nodes, edges, etc.)")
-            .parameters::<serde_json::Value>()
+            .parameters::<EmptyParams>()
         })
 }
